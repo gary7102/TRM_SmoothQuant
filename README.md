@@ -4,7 +4,7 @@ This repository is a reproduction and experimental verification of the paper “
 
 ## Experiments
 Environment setup
-```
+```bash
 python -m venv .venv && source .venv/bin/activate
 
 pip install -U pip wheel setuptools 
