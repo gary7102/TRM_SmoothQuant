@@ -56,32 +56,59 @@ def move_batch_to_device(batch: Any, device: torch.device) -> Any:
         return type(batch)(converted)
     return batch
 
+def forward_step(model: torch.nn.Module, batch: Dict[str, torch.Tensor], device: torch.device):
+    """
+    Run one full inference pass (until all sequences halt) on a single batch,
+    following the same logic as pretrain.evaluate().
+    Used only to drive activations for SmoothQuant calibration.
+    """
+    # move batch to device
+    batch = {k: v.to(device) for k, v in batch.items()}
 
-def forward_step(model: nn.Module, batch: Any) -> Any:
-    """Call model with batch (dict -> **batch, tuple/list -> *batch)."""
-    if batch is None:
-        return model()
-    if isinstance(batch, dict):
-        return model(**batch)
-    if isinstance(batch, (list, tuple)):
-        return model(*batch)
-    return model(batch)
+    with torch.inference_mode():
+        # initialize carry (ACT wrapper)
+        carry = model.initial_carry(batch)  # ACTLossHead -> TinyRecursiveReasoningModel_ACTV1
+
+        while True:
+            # call ACTLossHead.forward with correct signature
+            carry, _, _, _, all_finish = model(
+                carry=carry,
+                batch=batch,
+                return_keys=[],   # calibration 不需要輸出，只要有中間 activation
+            )
+            if bool(all_finish):
+                break
+
 
 
 def run_calibration(
-    model: nn.Module,
-    calib_loader: Iterable,
+    model: torch.nn.Module,
+    calib_loader,
     device: torch.device,
-    max_batches: int = 256,
-) -> None:
-    """Run a few forward passes over calib_loader (hooks do the real work)."""
+    max_batches: Optional[int] = None,
+):
+    """
+    Iterate over a small subset of eval_loader for activation calibration.
+    calib_loader yields (set_name, batch, global_batch_size),
+    same as in pretrain.evaluate().
+    """
     model.eval()
-    with torch.no_grad():
-        for i, batch in enumerate(calib_loader):
-            if i >= max_batches:
+    num_batches = 0
+
+    with torch.inference_mode():
+        for item in calib_loader:
+            if max_batches is not None and num_batches >= max_batches:
                 break
-            batch = move_batch_to_device(batch, device)
-            _ = forward_step(model, batch)
+
+            # eval_loader / calib_loader yields: (set_name, batch_dict, global_batch_size)
+            if isinstance(item, (tuple, list)) and len(item) == 3:
+                _, batch_dict, _ = item
+            else:
+                # fallback：假如之後你換成只 yield batch 的 dataloader
+                batch_dict = item
+
+            forward_step(model, batch_dict, device=device)
+            num_batches += 1
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +121,8 @@ def find_target_linears(model: nn.Module) -> Dict[str, nn.Module]:
     Currently: all instances of CastedLinear.
     """
     targets: Dict[str, nn.Module] = {}
-    for name, m in model.named_modules():
-        if isinstance(m, CastedLinear):
+    for name, module in model.named_modules():
+        if isinstance(module, CastedLinear) or isinstance(module, Attention):
             targets[name] = m
     return targets
 

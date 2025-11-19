@@ -357,7 +357,7 @@ def launch(hydra_config: DictConfig):
 
         # Use eval_loader as calibration loader
         _sq_info = apply_smoothquant(
-            model=eval_state.model,
+            model=train_state.model,
             alpha=config.sq_alpha,
             calib_loader=eval_loader,              # 直接用 eval_loader 做 calibration
             device=device,
