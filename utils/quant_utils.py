@@ -5,6 +5,18 @@ from typing import Dict, List, Any
 
 from models.layers import CastedLinear
 
+def _move_to_device(obj: Any, device: str):
+    """遞迴將 dataclass / dict / tensor 移到指定 device。"""
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, dict):
+        return {k: _move_to_device(v, device) for k, v in obj.items()}
+    # TRM 的 carry 是 dataclass，有 __dataclass_fields__
+    if hasattr(obj, "__dataclass_fields__"):
+        for f in obj.__dataclass_fields__:
+            setattr(obj, f, _move_to_device(getattr(obj, f), device))
+        return obj
+    return obj
 
 class W8A8Linear(nn.Module):
     """
@@ -63,17 +75,30 @@ class W8A8Linear(nn.Module):
         return x_deq.to(orig_dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # SmoothQuant input scaling：X' = X * s^-1
-        x = x * self.input_scale.to(x.device).to(x.dtype)
+        # [1] SmoothQuant Input Scaling
+        scale = self.input_scale.to(x.device).to(x.dtype)
+        view_shape = [1] * (x.dim() - 1) + [scale.shape[-1]]
+        x = x * scale.view(*view_shape)
 
-        # A8：per-tensor 假量化
+        # [2] Activation Fake Quant
         x_q = self._fake_quant_tensor(x, num_bits=8, per_channel=False)
 
-        # W8：per-output-channel 假量化
+        # [3] Weight Fake Quant
         w_q = self._fake_quant_tensor(self.weight, num_bits=8, per_channel=True, ch_axis=1)
 
-        return nn.functional.linear(x_q, w_q, self.bias)
+        # [4] 統一 Dtype (關鍵步驟)
+        # 將權重轉為與輸入相同的型別 (例如 BFloat16)
+        common_dtype = x_q.dtype
+        w_q = w_q.to(common_dtype)
+        
+        # 處理 Bias 的 Dtype
+        if self.bias is not None:
+            bias = self.bias.to(common_dtype)
+        else:
+            bias = None
 
+        # [5] Linear 運算 (使用局部變數 bias)
+        return nn.functional.linear(x_q, w_q, bias)
 
 # -----------------------------
 # Calibration：收集 Activation 統計
@@ -133,6 +158,7 @@ def calibrate_model(
     for i, batch in enumerate(calib_batches):
         batch_dev = {k: v.to(device) for k, v in batch.items()}
         carry = model.initial_carry(batch_dev)
+        carry = _move_to_device(carry, device)
         _carry, _outputs = model(carry, batch_dev)
 
         if i % 5 == 0:
@@ -152,7 +178,7 @@ def calibrate_model(
 def apply_smoothquant(
     model: nn.Module,
     act_abs_max: Dict[str, torch.Tensor],
-    alpha: float = 0.9,
+    alpha: float = 0.5,
 ) -> Dict[str, torch.Tensor]:
     """
     對每個 CastedLinear 套用 SmoothQuant：

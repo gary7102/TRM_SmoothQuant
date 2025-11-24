@@ -11,13 +11,18 @@ from pydantic import BaseModel
 
 # 本專案內部模組
 # from trm import TinyRecursiveReasoningModel_ACTV1, TinyRecursiveReasoningModel_ACTV1Config
-from models.recursive_reasoning.trm import TinyRecursiveReasoningModel_ACTV1, TinyRecursiveReasoningModel_ACTV1Config
+# from models.recursive_reasoning.trm import TinyRecursiveReasoningModel_ACTV1, TinyRecursiveReasoningModel_ACTV1Config
+from models.recursive_reasoning.trm import (
+    TinyRecursiveReasoningModel_ACTV1,
+    TinyRecursiveReasoningModel_ACTV1Config,
+)
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 from utils.quant_utils import (
     collect_calib_batches,
     calibrate_model,
     apply_smoothquant,
     replace_with_quantized_layers,
+    _move_to_device,
 )
 
 IGNORE_LABEL_ID = -100  # 與 models.losses / trm 中一致
@@ -184,7 +189,13 @@ def load_trm_from_checkpoint(
     load_checkpoint: str,
     device: str,
 ) -> TinyRecursiveReasoningModel_ACTV1:
-    model = TinyRecursiveReasoningModel_ACTV1(model_config)
+    
+    if hasattr(model_config, "dict"):
+        config_dict = model_config.dict()
+    else:
+        # 若未來升級到 pydantic v2，可用 model_dump()
+        config_dict = model_config.model_dump()
+    model = TinyRecursiveReasoningModel_ACTV1(config_dict)
     model.to(device)
 
     print(f"[run_eval] Loading checkpoint from {load_checkpoint}")
@@ -245,6 +256,10 @@ def maybe_apply_quantization(
 ):
     print(f"[run_eval] Quantization settings: use_smoothquant={use_smoothquant}, "
           f"sq_alpha={sq_alpha}, sq_max_calib_batches={sq_max_calib_batches}")
+          
+    # 保險起見，再次保證整個模型在正確 device
+    model.to(device)
+    model.eval()
 
     if use_smoothquant:
         print("[quant_utils] === SmoothQuant W8A8 模型準備開始 ===")
@@ -298,6 +313,9 @@ def evaluate_trm(
 
         # 初始 carry
         carry = model.initial_carry(batch_dev)
+        
+        # 把 carry 裡所有 tensor 搬到指定 device（和 calibration 階段一致）
+        carry = _move_to_device(carry, device)
 
         final_logits = None
 
