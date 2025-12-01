@@ -1,0 +1,4 @@
+token_accuracy: 0.9181805555555556
+exact_accuracy: 0.7771815095846646
+avg_steps: 16.0
+halt_rate: 1.0
