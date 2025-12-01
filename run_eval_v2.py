@@ -23,6 +23,7 @@ from utils.quant_utils import (
     apply_smoothquant,
     replace_with_quantized_layers,
     _move_to_device,
+    export_int8_config,
 )
 
 IGNORE_LABEL_ID = -100  # 與 models.losses / trm 中一致
@@ -253,6 +254,7 @@ def maybe_apply_quantization(
     use_smoothquant: bool,
     sq_alpha: float,
     sq_max_calib_batches: int,
+    checkpoint_path: str,
 ):
     print(f"[run_eval] Quantization settings: use_smoothquant={use_smoothquant}, "
           f"sq_alpha={sq_alpha}, sq_max_calib_batches={sq_max_calib_batches}")
@@ -269,6 +271,26 @@ def maybe_apply_quantization(
         act_stats = calibrate_model(model, calib_batches, device)
         # 套用 SmoothQuant（重寫權重、計算 input_scale）
         input_scales = apply_smoothquant(model, act_stats, alpha=sq_alpha)
+        
+        # === Step 1: 導出 INT8 quant config（α 已經用 sq_alpha，例如 0.5） ===
+        os.makedirs(checkpoint_path, exist_ok=True)
+        yaml_path = os.path.join(
+            checkpoint_path,
+            f"sudoku_trm_int8_config_alpha{sq_alpha:.1f}.yaml",
+        )
+        weight_path = os.path.join(
+            checkpoint_path,
+            f"sudoku_trm_int8_weights_alpha{sq_alpha:.1f}.pt",
+        )
+        export_int8_config(
+            model=model,
+            act_abs_max=act_stats,
+            input_scales_map=input_scales,
+            bits=8,
+            yaml_path=yaml_path,
+            weight_path=weight_path,
+        )
+
         # 轉成 W8A8Linear
         replace_with_quantized_layers(model, input_scales_map=input_scales)
     else:
@@ -418,6 +440,7 @@ def main():
         use_smoothquant=cfg.use_smoothquant,
         sq_alpha=cfg.sq_alpha,
         sq_max_calib_batches=cfg.sq_max_calib_batches,
+        checkpoint_path=cfg.checkpoint_path
     )
 
     # Evaluation（多步 ACT）

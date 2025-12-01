@@ -61,23 +61,27 @@
 #  sq_alpha=0.5 \
 #  sq_max_calib_batches=128
 
-# Baseline, BF16
-torchrun --standalone --nproc-per-node=1 run_eval.py \
+# BF16 baseline
+# torchrun --standalone --nproc-per-node=1 run_eval.py \
+#   arch=trm \
+#   data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+#   load_checkpoint=./checkpoints/sudoku_att/step_21700 \
+#   checkpoint_path=./eval_results/sudoku_att_bf16_baseline \
+#   global_batch_size=128 
+  
+# # Naive w8a8, non-smoothquant
+torchrun --standalone --nproc-per-node=1 run_eval_v2.py \
   arch=trm \
   data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-  evaluators="[]" \
-  arch.L_layers=2 arch.H_cycles=3 arch.L_cycles=6 \
   load_checkpoint=./checkpoints/sudoku_att/step_21700 \
-  checkpoint_path=./eval_results/sudoku_att_bf16_baseline \
+  checkpoint_path=./eval_results/sudoku_att_naive_w8a8 \
   global_batch_size=128 \
   use_smoothquant=false 
 
-# Smoothquant, alpha = 0.9
-torchrun --standalone --nproc-per-node=1 run_eval.py \
+# # Smoothquant, alpha = 0.9
+torchrun --standalone --nproc-per-node=1 run_eval_v2.py \
   arch=trm \
   data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-  evaluators="[]" \
-  arch.L_layers=2 arch.H_cycles=3 arch.L_cycles=6 \
   load_checkpoint=./checkpoints/sudoku_att/step_21700 \
   checkpoint_path=./eval_results/sudoku_att_smoothquant_a09 \
   global_batch_size=128 \
@@ -85,12 +89,21 @@ torchrun --standalone --nproc-per-node=1 run_eval.py \
   sq_alpha=0.9 \
   sq_max_calib_batches=128
   
-# Smoothquant, alpha = 0.5
-torchrun --standalone --nproc-per-node=1 run_eval.py \
+# # Smoothquant, alpha = 0.7
+torchrun --standalone --nproc-per-node=1 run_eval_v2.py \
   arch=trm \
   data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-  evaluators="[]" \
-  arch.L_layers=2 arch.H_cycles=3 arch.L_cycles=6 \
+  load_checkpoint=./checkpoints/sudoku_att/step_21700 \
+  checkpoint_path=./eval_results/sudoku_att_smoothquant_a07 \
+  global_batch_size=128 \
+  use_smoothquant=true \
+  sq_alpha=0.7 \
+  sq_max_calib_batches=128
+
+# # Smoothquant, alpha = 0.5
+torchrun --standalone --nproc-per-node=1 run_eval_v2.py \
+  arch=trm \
+  data_paths="[data/sudoku-extreme-1k-aug-1000]" \
   load_checkpoint=./checkpoints/sudoku_att/step_21700 \
   checkpoint_path=./eval_results/sudoku_att_smoothquant_a05 \
   global_batch_size=128 \
@@ -98,12 +111,10 @@ torchrun --standalone --nproc-per-node=1 run_eval.py \
   sq_alpha=0.5 \
   sq_max_calib_batches=128
 
-# Smoothquant, alpha = 0.3
-torchrun --standalone --nproc-per-node=1 run_eval.py \
+# # Smoothquant, alpha = 0.3
+torchrun --standalone --nproc-per-node=1 run_eval_v2.py \
   arch=trm \
   data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-  evaluators="[]" \
-  arch.L_layers=2 arch.H_cycles=3 arch.L_cycles=6 \
   load_checkpoint=./checkpoints/sudoku_att/step_21700 \
   checkpoint_path=./eval_results/sudoku_att_smoothquant_a03 \
   global_batch_size=128 \
@@ -112,7 +123,7 @@ torchrun --standalone --nproc-per-node=1 run_eval.py \
   sq_max_calib_batches=128
 
 # Smoothquant, alpha = 0.1
-torchrun --standalone --nproc-per-node=1 run_eval.py \
+torchrun --standalone --nproc-per-node=1 run_eval_v2.py \
   arch=trm \
   data_paths="[data/sudoku-extreme-1k-aug-1000]" \
   load_checkpoint=./checkpoints/sudoku_att/step_21700 \
@@ -121,4 +132,3 @@ torchrun --standalone --nproc-per-node=1 run_eval.py \
   use_smoothquant=true \
   sq_alpha=0.1 \
   sq_max_calib_batches=128
-
