@@ -372,93 +372,174 @@ def export_int8_config(
 # =============================
 # Bit-exact INT8 Linear 模擬
 # =============================
-class Int8Linear(nn.Module):
-    """
-    Bit-exact INT8 Linear 模擬：
-
-    forward(x_fp):
-      1) z = x_fp * input_scale           # SmoothQuant pre-scale
-      2) x_int8 = round(z / act_scale)    # clamp 到 [-128,127]
-      3) acc_int32 = x_int8 @ weight_int8^T + bias_int32
-      4) y_fp = acc_int32 * output_scale  # per-output-channel
-      5) cast 回原本 dtype (bf16 / fp32)
-
-    所有參數來自 export_int8_config 輸出的 YAML + .pt：
-      - input_scale: [in_features]
-      - act_scale:   scalar
-      - weight_int8: [out_features, in_features]
-      - bias_int32:  [out_features]
-      - output_scale:[out_features]
-    """
-
+class Int8Linear(torch.nn.Module):
     def __init__(
         self,
         in_features: int,
         out_features: int,
-        weight_int8: torch.Tensor,   # [out, in], int8
-        bias_int32: torch.Tensor,    # [out], int32
-        input_scale: torch.Tensor,   # [in], float32
-        act_scale: float,            # scalar
-        output_scale: torch.Tensor,  # [out], float32
+        weight_int8: torch.Tensor,
+        bias_int32: torch.Tensor,
+        input_scale: torch.Tensor,
+        act_scale: float,
+        output_scale: torch.Tensor,
         bits: int = 8,
     ):
         super().__init__()
-        self.in_features = int(in_features)
-        self.out_features = int(out_features)
-        self.bits = int(bits)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bits = bits
 
-        # 量化後權重 / bias / scale 全放 buffer，方便 .to(device)
+        # 量化後的整數權重 / bias
         self.register_buffer("weight_int8", weight_int8.to(torch.int8))
-        self.register_buffer("bias_int32", bias_int32.to(torch.int32))
-        self.register_buffer("input_scale", input_scale.to(torch.float32))
-        self.register_buffer("output_scale", output_scale.to(torch.float32))
+        if bias_int32 is not None:
+            self.register_buffer("bias_int32", bias_int32.to(torch.int32))
+        else:
+            self.bias_int32 = None
 
-        # act_scale 用 float 儲存即可
+        # SmoothQuant 的輸入 scaling（per-channel）
+        self.register_buffer("input_scale", input_scale.to(torch.float32))
+
+        # activation per-tensor scale
         self.act_scale = float(act_scale)
 
-    def forward(self, x_fp: torch.Tensor) -> torch.Tensor:
+        # output_scale 可能是 scalar 或 per-channel，統一成 float32 buffer
+        self.register_buffer("output_scale", output_scale.to(torch.float32))
+
+    @staticmethod
+    def _quantize_to_int8(x: torch.Tensor, act_scale: float, bits: int = 8) -> torch.Tensor:
+        qmax = 2 ** (bits - 1) - 1  # 127
+        qmin = -2 ** (bits - 1)     # -128
+
+        if act_scale <= 0:
+            raise ValueError(f"act_scale must be > 0, got {act_scale}")
+
+        x_scaled = x / act_scale
+        x_rounded = torch.round(x_scaled)
+        x_clamped = torch.clamp(x_rounded, qmin, qmax)
+        return x_clamped.to(torch.int8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x_fp: [..., in_features]，可以是 [B, S, H] 或 [B, H]
-        回傳: [..., out_features]，dtype 與 x_fp 相同
+        整數路徑（在 CUDA 上用 FP32 精確模擬）：
+          1) x_fp32 = x * input_scale
+          2) x_int8 = quantize(x_fp32 / act_scale)
+          3) acc = (x_int8 @ w_int8^T)  # 在 FP32 中做，數值等同 int32 累加
+          4) acc += bias_int32
+          5) y = acc * output_scale
         """
-        orig_dtype = x_fp.dtype
-        device = x_fp.device
 
-        x = x_fp.to(torch.float32)
-        last_dim = x.shape[-1]
-        assert (
-            last_dim == self.in_features
-        ), f"Int8Linear: in_features mismatch, got {last_dim}, expected {self.in_features}"
+        # 1. 先轉成 float32，乘 SmoothQuant input_scale
+        x_fp32 = x.to(torch.float32)
+        inp_scale = self.input_scale.to(x_fp32.device, x_fp32.dtype)  # [in_features]
+        x_scaled = x_fp32 * inp_scale  # broadcasting on last dim
 
-        # 攤平成 [N, in]
-        x_flat = x.view(-1, self.in_features)  # [N, in]
+        # 2. 固定 act_scale 做 per-tensor quant → int8
+        x_int8 = self._quantize_to_int8(x_scaled, self.act_scale, self.bits)  # int8
+        w_int8 = self.weight_int8.to(x_int8.device)                           # int8
 
-        # 1) SmoothQuant pre-scale：z = x * input_scale
-        # input_scale: [in] → broadcast 成 [N, in]
-        z = x_flat * self.input_scale.to(device)  # [N, in]
+        # 3. 用 FP32 模擬 int8×int8→int32（不會有數值誤差）
+        x_int = x_int8.to(torch.float32)
+        w_int = w_int8.to(torch.float32)
+        acc = x_int @ w_int.t()  # [N, out_features], float32，數值上是整數
 
-        # 2) Activation quantization: z → x_int8
-        qmin = -(2 ** (self.bits - 1))
-        qmax = (2 ** (self.bits - 1)) - 1
-
-        x_int32 = torch.round(z / self.act_scale).clamp(qmin, qmax).to(torch.int32)  # [N, in]
-
-        # 3) Weight int8 → int32，做 matmul
-        w_int32 = self.weight_int8.to(torch.int32)  # [out, in]
-        acc = x_int32 @ w_int32.t()                 # [N, out], int32
-
-        # 4) 加上 bias_int32
+        # 4. 加上 bias（原本設計為 int32 累加後再加）
         if self.bias_int32 is not None:
-            acc = acc + self.bias_int32.to(device)  # broadcast [out]
+            acc = acc + self.bias_int32.to(acc.device).to(torch.float32)
 
-        # 5) Dequant: y_fp32 = acc_int32 * output_scale（per-output-channel）
-        y_fp32 = acc.to(torch.float32) * self.output_scale.to(device).view(1, -1)  # [N, out]
+        # 5. 乘上 output_scale 回到 float
+        out_scale = self.output_scale.to(acc.device, acc.dtype)
+        y = acc * out_scale  # float32
 
-        # 6) reshape 回原本 batch/seq 維度，並轉回原本 dtype
-        new_shape = x_fp.shape[:-1] + (self.out_features,)
-        y_fp32 = y_fp32.view(*new_shape)
+        # 視需求決定回傳型別：這裡回傳 float32；若希望跟原層 dtype 一致可改成 y.to(x.dtype)
+        return y
 
-        return y_fp32.to(orig_dtype)
+# class Int8Linear(nn.Module):
+#     """
+#     Bit-exact INT8 Linear 模擬：
+
+#     forward(x_fp):
+#       1) z = x_fp * input_scale           # SmoothQuant pre-scale
+#       2) x_int8 = round(z / act_scale)    # clamp 到 [-128,127]
+#       3) acc_int32 = x_int8 @ weight_int8^T + bias_int32
+#       4) y_fp = acc_int32 * output_scale  # per-output-channel
+#       5) cast 回原本 dtype (bf16 / fp32)
+
+#     所有參數來自 export_int8_config 輸出的 YAML + .pt：
+#       - input_scale: [in_features]
+#       - act_scale:   scalar
+#       - weight_int8: [out_features, in_features]
+#       - bias_int32:  [out_features]
+#       - output_scale:[out_features]
+#     """
+
+#     def __init__(
+#         self,
+#         in_features: int,
+#         out_features: int,
+#         weight_int8: torch.Tensor,   # [out, in], int8
+#         bias_int32: torch.Tensor,    # [out], int32
+#         input_scale: torch.Tensor,   # [in], float32
+#         act_scale: float,            # scalar
+#         output_scale: torch.Tensor,  # [out], float32
+#         bits: int = 8,
+#     ):
+#         super().__init__()
+#         self.in_features = int(in_features)
+#         self.out_features = int(out_features)
+#         self.bits = int(bits)
+
+#         # 量化後權重 / bias / scale 全放 buffer，方便 .to(device)
+#         self.register_buffer("weight_int8", weight_int8.to(torch.int8))
+#         self.register_buffer("bias_int32", bias_int32.to(torch.int32))
+#         self.register_buffer("input_scale", input_scale.to(torch.float32))
+#         self.register_buffer("output_scale", output_scale.to(torch.float32))
+
+#         # act_scale 用 float 儲存即可
+#         self.act_scale = float(act_scale)
+
+#     def forward(self, x_fp: torch.Tensor) -> torch.Tensor:
+#         """
+#         x_fp: [..., in_features]，可以是 [B, S, H] 或 [B, H]
+#         回傳: [..., out_features]，dtype 與 x_fp 相同
+#         """
+#         orig_dtype = x_fp.dtype
+#         device = x_fp.device
+
+#         x = x_fp.to(torch.float32)
+#         last_dim = x.shape[-1]
+#         assert (
+#             last_dim == self.in_features
+#         ), f"Int8Linear: in_features mismatch, got {last_dim}, expected {self.in_features}"
+
+#         # 攤平成 [N, in]
+#         x_flat = x.view(-1, self.in_features)  # [N, in]
+
+#         # 1) SmoothQuant pre-scale：z = x * input_scale
+#         # input_scale: [in] → broadcast 成 [N, in]
+#         z = x_flat * self.input_scale.to(device)  # [N, in]
+
+#         # 2) Activation quantization: z → x_int8
+#         qmin = -(2 ** (self.bits - 1))
+#         qmax = (2 ** (self.bits - 1)) - 1
+
+#         x_int32 = torch.round(z / self.act_scale).clamp(qmin, qmax).to(torch.int32)  # [N, in]
+
+#         # 3) Weight int8 → int32，做 matmul
+#         w_int32 = self.weight_int8.to(torch.int32)  # [out, in]
+#         acc = x_int32 @ w_int32.t()                 # [N, out], int32
+
+#         # 4) 加上 bias_int32
+#         if self.bias_int32 is not None:
+#             acc = acc + self.bias_int32.to(device)  # broadcast [out]
+
+#         # 5) Dequant: y_fp32 = acc_int32 * output_scale（per-output-channel）
+#         y_fp32 = acc.to(torch.float32) * self.output_scale.to(device).view(1, -1)  # [N, out]
+
+#         # 6) reshape 回原本 batch/seq 維度，並轉回原本 dtype
+#         new_shape = x_fp.shape[:-1] + (self.out_features,)
+#         y_fp32 = y_fp32.view(*new_shape)
+
+#         return y_fp32.to(orig_dtype)
 
 def build_int8_linear_from_config(
     layer_name: str,
@@ -507,3 +588,83 @@ def build_int8_linear_from_config(
     )
 
     return int8_layer.to(device)
+
+
+
+def replace_with_int8_from_config(
+    model: torch.nn.Module,
+    yaml_path: str,
+    weight_path: str,
+    device: str = "cuda",
+    target_layers: list[str] | None = None,
+):
+    """
+    將模型中的 CastedLinear 部分或全部替換為 Int8Linear。
+
+    - yaml_path / weight_path: 來自 export_int8_config 的輸出
+    - target_layers:
+        * None: 替換所有在 YAML config 中有紀錄的層
+        * list[str]: 只替換指定的 layer_name
+    """
+    with open(yaml_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    layers_cfg = cfg["layers"]
+    weight_tensors = torch.load(weight_path, map_location="cpu")
+
+    if target_layers is None:
+        target_layers = list(layers_cfg.keys())
+    else:
+        # 避免打錯名字
+        target_layers = [name for name in target_layers if name in layers_cfg]
+
+    # 先收集所有需要替換的 (full_name, parent_module, child_name)
+    modules_to_replace = []
+
+    for full_name, module in model.named_modules():
+        if not isinstance(module, CastedLinear):
+            continue
+        if full_name not in target_layers:
+            continue
+
+        # 找 parent module 與 child 名稱
+        if "." in full_name:
+            parent_name, child_name = full_name.rsplit(".", 1)
+            parent = model.get_submodule(parent_name)
+        else:
+            parent = model
+            child_name = full_name
+
+        modules_to_replace.append((full_name, parent, child_name))
+
+    # 實際替換
+    replaced = 0
+    for full_name, parent, child_name in modules_to_replace:
+        layer_cfg = layers_cfg[full_name]
+        in_features = int(layer_cfg["in_features"])
+        out_features = int(layer_cfg["out_features"])
+        input_scale = torch.tensor(layer_cfg["input_scale"], dtype=torch.float32)
+        act_scale = float(layer_cfg["act_scale"])
+        output_scale = torch.tensor(layer_cfg["output_scale"], dtype=torch.float32)
+
+        w_int8 = weight_tensors[f"{full_name}.weight_int8"]
+        b_int32 = weight_tensors[f"{full_name}.bias_int32"]
+
+        bits = int(layer_cfg.get("bits", cfg.get("bits", 8)))
+
+        int8_layer = Int8Linear(
+            in_features=in_features,
+            out_features=out_features,
+            weight_int8=w_int8,
+            bias_int32=b_int32,
+            input_scale=input_scale,
+            act_scale=act_scale,
+            output_scale=output_scale,
+            bits=bits,
+        ).to(device)
+
+        setattr(parent, child_name, int8_layer)
+        replaced += 1
+        print(f"[int8_replace] Replaced {full_name} with Int8Linear.")
+
+    print(f"[int8_replace] Total replaced layers: {replaced}")
